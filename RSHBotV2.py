@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 # ------------ CONFIGURATION ------------
 
-load_dotenv(".env")
+load_dotenv(r"Bot Discord/RSHBot/tokv2.env")
 OWNER_ID = 979806223580926013
 TOKEN = os.getenv("DISCORD_TOKEN")
 
