@@ -10,4 +10,4 @@ RSHBotV2 est un bot Discord complet et polyvalent, conçu pour offrir une expér
 
 🛠️ Personnalisation : le bot s’adapte aux besoins de chaque serveur grâce à une configuration simple et flexible.
 
-VERSION : 2.3.0
+💻 VERSION : 2.3.0
