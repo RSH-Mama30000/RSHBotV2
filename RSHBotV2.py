@@ -2,7 +2,6 @@
 
 import discord
 import yt_dlp
-import platform
 import datetime
 import random
 import os
@@ -11,15 +10,16 @@ import json
 
 from discord.ext import commands, tasks
 from discord import app_commands, Interaction, Member, Embed
+from discord import ui
 from dotenv import load_dotenv
 
 # ------------ CONFIGURATION ------------ #
 
 OWNER_ID = 979806223580926013
 LOG_CHANNEL_ID = 1412454772380008459
-VERSION_BOT_INFO = "1.17.1"
-VERSION_STATUT = "Version 1.17.1"
-VERSION_LOGS = "1.17.1"
+VERSION_BOT_INFO = "2.3.0"
+VERSION_STATUT = "Version 2.3.0"
+VERSION_LOGS = "2.3.0"
 MUTED_ROLE_NAME = "Muted"
 WARN_ROLE_1_NAME = "Warn 1"
 WARN_ROLE_2_NAME = "Warn 2"
@@ -29,21 +29,25 @@ WELCOME_FILE = "welcome_channels.json"
 MUTES_FILE = "scheduled_mutes.json"
 BANS_FILE = "scheduled_bans.json"
 WARN_FILE = "warnings.json"
-
+ 
 load_dotenv("C:/Users/vegah/Desktop/Codage VSCode/Bot Discord/RSHBot/tokv2.env")
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 # ----------- INTENTS ------------ #
 
-intents = discord.Intents.default()
+intents = discord.Intents.all()
 intents.message_content = True
 intents.guilds = True   
 intents.voice_states = True
 intents.members = True 
 guild_players = {}
+guild_text_channels = {}
+queues = {}
+volumes = {}
+current_track = {}
 start_time = None  # Sera initialisé dans on_ready
 
-bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
+bot = commands.Bot(command_prefix='!', intents=intents, help_command=None, reconnect=True)
 
 # ------------ JSON ------------ #
 
@@ -171,6 +175,49 @@ def pop_last_warning(guild_id: int, user_id: int):
 
 # ------------ def ------------ #
 
+async def safe_defer(interaction: discord.Interaction, ephemeral: bool = False):
+    """Essaye de `defer` l'interaction de façon sûre.
+
+    Certains cas (interaction expirée ou déjà répondue) lancent
+    discord.errors.NotFound. On l'ignore ici pour que le reste
+    du traitement puisse continuer (on utilisera `followup.send`).
+    """
+    try:
+        # interaction.response.is_done() retourne True si déjà acknowleged
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=ephemeral)
+    except discord.errors.NotFound:
+        # Interaction unknown/expired — on ignore, on continuera avec followup
+        return
+    except Exception as e:
+        # Petits logs en console pour débogage sans interrompre la commande
+        print(f"safe_defer error: {e}")
+        return
+
+ 
+async def safe_followup(interaction: discord.Interaction, *args, **kwargs):
+    """Envoie un followup de façon sûre : si l'interaction est inconnue/expirée,
+    tente d'envoyer le message dans le channel courant (si accessible).
+    Usage : await safe_followup(interaction, "texte", ephemeral=True) ou kwargs comme embed=..., view=...
+    """
+    try:
+        # Si l'interaction a été initialement acked, followup fonctionnera
+        await interaction.followup.send(*args, **kwargs)
+    except discord.errors.NotFound:
+        # Interaction inconnue/expirée -> fallback : essayer d'envoyer directement au channel
+        try:
+            ch = getattr(interaction, 'channel', None)
+            if ch:
+                # Si ephemeral demandé, on ne peut pas reproduire ; envoie public
+                await ch.send(*args, **{k: v for k, v in kwargs.items() if k != 'ephemeral'})
+        except Exception:
+            # Tout échoue silencieusement pour ne pas crasher le bot
+            return
+    except Exception as e:
+        # Log et ignore
+        print(f"safe_followup error: {e}")
+        return
+
 async def get_muted_role(guild: discord.Guild):
     muted_role = discord.utils.get(guild.roles, name=MUTED_ROLE_NAME)
     if muted_role is None:
@@ -273,6 +320,105 @@ async def process_schedules():
 
         await asyncio.sleep(30)
 
+async def start_playing(guild_id: int, title: str, url: str):
+    vc = guild_players[guild_id]
+    current_track[guild_id] = (title, url)
+    volumes[guild_id] = volumes.get(guild_id, 0.5)
+
+    # Exécute yt_dlp dans un thread pour ne pas bloquer la boucle async (évite les coupures/crépits)
+    ydl_opts = {'format': 'bestaudio'}
+    ffmpeg_opts = {
+        # -ar 48000 et -ac 2 : Discord requiert du 48kHz stéréo pour une lecture sans artefacts
+        # -f s16le : format PCM signé 16-bit
+        'options': '-vn -ar 48000 -ac 2 -f s16le -nostdin',
+        'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = await asyncio.to_thread(ydl.extract_info, url, False)
+        audio_url = info.get('url')
+
+    # Crée la source en PCM à la fréquence appropriée, puis applique le volume
+    source = discord.FFmpegPCMAudio(audio_url, **ffmpeg_opts)
+    source = discord.PCMVolumeTransformer(source, volume=volumes[guild_id])
+    vc.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(guild_id), bot.loop))
+
+    await send_music_embed(guild_id, title)
+
+async def play_next(guild_id: int):
+    if queues[guild_id]:
+        t, u = queues[guild_id].pop(0)
+        await start_playing(guild_id, t, u)
+
+# ------------ BOUTON ------------ #
+
+class MusicControls(discord.ui.View):
+    def __init__(self, vc: discord.VoiceClient, guild_id: int):
+        super().__init__(timeout=None)
+        self.vc = vc
+        self.guild_id = guild_id
+
+    @discord.ui.button(label="⏯ Pause / Reprendre", style=discord.ButtonStyle.blurple)
+    async def pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = guild_players.get(self.guild_id)
+        if vc.is_playing():
+            vc.pause()
+            await interaction.response.send_message("⏸ Musique mise en pause", ephemeral=True)
+        elif vc.is_paused():
+            vc.resume()
+            await interaction.response.send_message("▶️ Musique relancée", ephemeral=True)
+
+    @discord.ui.button(label="⏭ Passer", style=discord.ButtonStyle.green)
+    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = guild_players.get(self.guild_id)
+        if vc.is_playing() or vc.is_paused():
+            vc.stop()
+        await interaction.response.send_message("⏭ Musique passée", ephemeral=True)
+
+    @discord.ui.button(label="🔉 -", style=discord.ButtonStyle.gray)
+    async def volume_down(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = guild_players.get(self.guild_id)
+        if hasattr(vc.source, "volume"):
+            volumes[self.guild_id] = max(0.0, volumes.get(self.guild_id, 0.5) - 0.1)
+            vc.source.volume = volumes[self.guild_id]
+            await interaction.response.send_message(f"🔉 Volume: {int(volumes[self.guild_id]*100)}%", ephemeral=True)
+
+    @discord.ui.button(label="🔊 +", style=discord.ButtonStyle.gray)
+    async def volume_up(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = guild_players.get(self.guild_id)
+        if hasattr(vc.source, "volume"):
+            volumes[self.guild_id] = min(2.0, volumes.get(self.guild_id, 0.5) + 0.1)
+            vc.source.volume = volumes[self.guild_id]
+            await interaction.response.send_message(f"🔊 Volume: {int(volumes[self.guild_id]*100)}%", ephemeral=True)
+
+    @discord.ui.button(label="🔁 Rejouer", style=discord.ButtonStyle.red)
+    async def restart(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.guild_id in current_track:
+            title, url = current_track[self.guild_id]
+            queues[self.guild_id].insert(0, (title, url))
+            vc = guild_players.get(self.guild_id)
+            vc.stop()
+            await interaction.response.send_message("🔁 Rejoué depuis le début", ephemeral=True)
+            
+async def send_music_embed(guild_id: int, title: str):
+    guild = bot.get_guild(guild_id)
+    vc = guild_players.get(guild_id)
+    if not vc or guild_id not in guild_text_channels:
+        return
+
+    channel = guild.get_channel(guild_text_channels[guild_id])
+    if not channel:
+        return
+
+    embed = discord.Embed(
+        title="🎶 Lecture en cours",
+        description=f"**{title}**",
+        color=0x00ffcc
+    )
+    embed.set_footer(text="RSH Music System")
+    view = MusicControls(vc, guild_id)
+    await channel.send(embed=embed, view=view)
+
 # ------------ DONNÉES POUR /commande ------------ #
   
 categories = {
@@ -292,6 +438,7 @@ categories = {
     "utilitaires": {
         "ℹ️ Bot Info": {"description": "Affiche des informations sur le bot.", "syntax": "/botinfo"},
         "👥 Équipe": {"description": "Présentation de l'équipe qui a crée RSHBotV2.", "syntax": "/equipe"},
+        "🫂 Discord": {"description": "Lien d'invitation du serveur Discord de RSHBotV2.", "syntax": "/discord"},
         "🗣️ Dire": {"description": "Fait dire quelque chose au bot.", "syntax": "/dire [message]"},
         "🧹 Effacer": {"description": "Efface un certain nombre de messages.", "syntax": "/effacer [nombre]"},
         "🖼️ Avatar": {"description": "Affiche la photo de profil d'un utilisateur.", "syntax": "/avatar [ID discord]"},
@@ -316,6 +463,8 @@ categories = {
         "🔚 StopMP": {"description": "Arrête le chat MP dans ce salon", "syntax": "/stopmp"},
         "🏠 Bienvenue Set": {"description": "Définit le salon courant comme salon d'accueil pour les nouveaux membres.", "syntax": "/bienvenue_set"},
         "🏠 Bienvenue Remove": {"description": "Supprime le salon d'accueil configuré pour ce serveur.", "syntax": "/bienvenue_remove"},
+        "📋 Warn List": {"description": "Affiche la liste des avertissements d'un membre.", "syntax": "/warnlist"},
+        "📜 Ban List": {"description": "Affiche la liste des membres bannis du serveur.", "syntax": "/banlist"},
     },
 }
 
@@ -555,7 +704,6 @@ async def equipe(interaction: discord.Interaction):
     embed.set_thumbnail(url=bot_user.avatar.url if bot_user.avatar else bot_user.default_avatar.url)
     embed.add_field(name="👨‍💻 RSH-Mama30000", value="Développeur principal de RSHBotV2", inline=False)
     embed.add_field(name="👨‍🏫 El Tulipe", value="A aidé et appris à RSH-Mama30000 à développer en Python", inline=False)
-    embed.add_field(name="🎓 こっそり·ᵉˣᵉ", value="Apprenti développeur de RSHBotV2", inline=False)
     embed.add_field(name="Tu veux rejoindre l'équipe ?", value="Si oui ouvre un https://discord.com/channels/1310182105577426994/1343343848004386867 !", inline=False)
     embed.timestamp = discord.utils.utcnow()
     
@@ -636,8 +784,7 @@ async def bienvenue_remove(interaction: discord.Interaction):
 @bot.tree.command(name="dire", description="Permet de dire quelque chose sous l'identité de RSHBotV2.")
 @app_commands.describe(message="Le message à envoyer sous l'identité de RSHBotV2.")
 async def dire(interaction: discord.Interaction, message: str):
-
-    await interaction.response.defer(ephemeral=True)
+    await safe_defer(interaction, ephemeral=True)
 
     await interaction.channel.send(message)
     
@@ -660,7 +807,7 @@ async def effacer(interaction: discord.Interaction, nombre: int):
         await interaction.response.send_message("❌ Veuillez entrer un nombre entre 1 et 500.", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
+    await safe_defer(interaction, ephemeral=True)
 
     deleted = await interaction.channel.purge(limit=nombre, check=lambda m: not m.pinned)
 
@@ -784,6 +931,23 @@ async def uptime(interaction: discord.Interaction):
     embed.set_thumbnail(url=interaction.client.user.display_avatar.url)
 
     await interaction.response.send_message(embed=embed)
+    
+@bot.tree.command(name="discord", description="Informations pour rejoindre le serveur Discord de RSHBotV2")
+async def discord_info(interaction: discord.Interaction):
+    bot_user = bot.user
+    
+    embed = discord.Embed(
+        title="Rejoindre le serveur Discord de RSHBotV2",
+        description="Pour toute question, suggestion ou simplement pour discuter avec la communauté et l'équipe de développement, rejoins notre serveur Discord !",
+        color=discord.Color.blue(),
+    )
+    embed.set_thumbnail(url=bot_user.avatar.url if bot_user.avatar else bot_user.default_avatar.url)
+    embed.add_field(name="🔗 Lien d'invitation", value="[Clique ici pour rejoindre le serveur Discord de RSHBotV2](https://discord.gg/PUgBqTS9df)", inline=False)
+    embed.add_field(name="👥 Communauté", value="Rejoins une communauté active et amicale prête à t'aider et à partager des idées.", inline=False)
+    embed.add_field(name="🛠️ Support", value="Obtiens de l'aide directement de l'équipe de développement et des autres utilisateurs.", inline=False)
+    embed.timestamp = discord.utils.utcnow()
+
+    await interaction.response.send_message(embed=embed) 
     
 # ------------ MODÉRATION ------------ #
 
@@ -1125,7 +1289,7 @@ async def mute(interaction: discord.Interaction, membre: discord.Member, duree: 
         return await interaction.response.send_message("❌ Tu ne peux pas mute un administrateur.", ephemeral=True)
     # Défère la réponse pour éviter le timeout si on effectue des opérations longues (DM, écriture JSON...)
     try:
-        await interaction.response.defer()
+        await safe_defer(interaction)
     except Exception:
         # Si la réponse était déjà faite, on ignore
         pass
@@ -1539,6 +1703,143 @@ async def unwarn(interaction: discord.Interaction, membre: discord.Member):
             await interaction.response.send_message("Impossible d'ouvrir la fenêtre interactive.", ephemeral=True)
         except Exception:
             pass
+
+
+@bot.tree.command(name="warnlist", description="Liste les avertissements (pour un membre ou pour le serveur)")
+@app_commands.describe(membre="Le membre (optionnel)")
+async def warnlist(interaction: discord.Interaction, membre: discord.Member = None):
+    # Restreindre l'utilisation aux modérateurs
+    if not getattr(interaction.user, "guild_permissions", None) or not interaction.user.guild_permissions.moderate_members:
+        return await interaction.response.send_message("❌ Tu n'as pas la permission d'utiliser cette commande.", ephemeral=True)
+
+    if not interaction.guild:
+        return await interaction.response.send_message("❌ Cette commande doit être utilisée dans un serveur.", ephemeral=True)
+
+    guild_warnings = warnings.get(interaction.guild.id, {})
+
+    # Si un membre est fourni : lister ses warns
+    if membre:
+        user_warns = guild_warnings.get(membre.id, [])
+        if not user_warns:
+            return await interaction.response.send_message(f"ℹ️ {membre.mention} n'a aucun avertissement.", ephemeral=True)
+
+        embed = discord.Embed(
+            title=f"Avertissements de {membre}",
+            description=f"Total : {len(user_warns)}",
+            color=discord.Color.orange(),
+            timestamp=discord.utils.utcnow()
+        )
+
+        # limiter pour l'affichage
+        max_show = 15
+        for i, e in enumerate(user_warns[-max_show:], start=max(1, len(user_warns)-max_show+1)):
+            mod_id = e.get("moderator_id")
+            try:
+                moderator = interaction.guild.get_member(mod_id) or await bot.fetch_user(mod_id)
+                moderator_display = f"{moderator} ({mod_id})"
+            except Exception:
+                moderator_display = str(mod_id)
+            ts = e.get("timestamp") or 0
+            embed.add_field(name=f"#{i} — ID: {e.get('id')}", value=(f"Raison: {e.get('reason')}\nModérateur: {moderator_display}\nDate: <t:{int(ts)}:F>"), inline=False)
+
+        if len(user_warns) > max_show:
+            embed.set_footer(text=f"Affichage des {max_show} derniers warns sur {len(user_warns)}")
+
+        return await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # Sinon : lister un résumé pour le serveur (utilisateurs et compte de warns)
+    if not guild_warnings:
+        return await interaction.response.send_message("ℹ️ Aucun avertissement enregistré pour ce serveur.", ephemeral=True)
+
+    embed = discord.Embed(
+        title=f"Liste des avertissements — {interaction.guild.name}",
+        description="Résumé des membres ayant des avertissements",
+        color=discord.Color.orange(),
+        timestamp=discord.utils.utcnow()
+    )
+
+    # Trier par nombre d'avertissements décroissant
+    users_sorted = sorted(guild_warnings.items(), key=lambda kv: len(kv[1]) if kv[1] else 0, reverse=True)
+    max_users = 20
+    for uid, lst in users_sorted[:max_users]:
+        try:
+            member = interaction.guild.get_member(uid) or await bot.fetch_user(uid)
+            name = f"{member}"
+        except Exception:
+            name = str(uid)
+        embed.add_field(name=name, value=f"{len(lst)} avertissement(s)", inline=True)
+
+    if len(users_sorted) > max_users:
+        embed.set_footer(text=f"Affichage des {max_users} premiers utilisateurs sur {len(users_sorted)}")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="banlist", description="Affiche les bans actuels et les bans programmés pour le serveur")
+@app_commands.describe(membre="Filtre par membre (optionnel, ID ou mention)")
+async def banlist(interaction: discord.Interaction, membre: discord.Member = None):
+    # Permissions : ban_members ou modération
+    if not getattr(interaction.user, "guild_permissions", None) or not interaction.user.guild_permissions.ban_members:
+        return await interaction.response.send_message("❌ Tu n'as pas la permission d'utiliser cette commande.", ephemeral=True)
+
+    if not interaction.guild:
+        return await interaction.response.send_message("❌ Cette commande doit être utilisée dans un serveur.", ephemeral=True)
+
+    embed = discord.Embed(
+        title=f"Bans — {interaction.guild.name}",
+        color=discord.Color.red(),
+        timestamp=discord.utils.utcnow()
+    )
+
+    # Bans actuels
+    try:
+        bans = await interaction.guild.bans()
+    except Exception:
+        bans = []
+
+    if membre:
+        # Filtrer par membre
+        target_id = membre.id
+        current_bans = [b for b in bans if getattr(b.user, 'id', None) == target_id]
+    else:
+        current_bans = bans
+
+    if current_bans:
+        val = []
+        for b in current_bans[:15]:
+            user = b.user
+            reason = b.reason or "Aucune raison fournie"
+            val.append(f"{user} (`{user.id}`) — {reason}")
+        embed.add_field(name="Bans actuels", value="\n".join(val), inline=False)
+        if len(current_bans) > 15:
+            embed.add_field(name="...", value=f"Et {len(current_bans)-15} autres bans", inline=False)
+    else:
+        embed.add_field(name="Bans actuels", value="Aucun ban actuel", inline=False)
+
+    # Bans programmés (scheduled_bans)
+    scheduled = [v for k, v in scheduled_bans.items() if v.get("guild_id") == interaction.guild.id]
+    if membre:
+        scheduled = [s for s in scheduled if s.get("user_id") == membre.id]
+
+    if scheduled:
+        lines = []
+        for s in sorted(scheduled, key=lambda x: x.get("expiration", 0))[:15]:
+            uid = s.get("user_id")
+            reason = s.get("reason") or "Aucune raison"
+            exp = int(s.get("expiration", 0))
+            try:
+                user = await bot.fetch_user(uid)
+                user_display = f"{user} (`{uid}`)"
+            except Exception:
+                user_display = f"`{uid}`"
+            lines.append(f"{user_display} — {reason} — Fin: <t:{exp}:F>")
+        embed.add_field(name="Bans programmés", value="\n".join(lines), inline=False)
+        if len(scheduled) > 15:
+            embed.add_field(name="...", value=f"Et {len(scheduled)-15} autres bans programmés", inline=False)
+    else:
+        embed.add_field(name="Bans programmés", value="Aucun ban programmé", inline=False)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
     
 # ------------ MUSIQUE ------------ #
     
@@ -1549,33 +1850,33 @@ async def rejoindre(interaction: discord.Interaction):
         voice_client = interaction.guild.voice_client
 
         try:
-            await interaction.response.defer()  # Délai de réponse
+            await safe_defer(interaction)  # Délai de réponse
 
             # Si le bot est déjà connecté
             if voice_client:
                 try:
                     if voice_client.is_connected():
                         if voice_client.channel.id == channel.id:
-                            await interaction.followup.send(f"Je suis déjà dans le salon vocal : **{channel.name}**")
+                            await safe_followup(interaction, f"Je suis déjà dans le salon vocal : **{channel.name}**")
                         else:
                             await voice_client.move_to(channel)
-                            await interaction.followup.send(f"Je me déplace vers le salon vocal : **{channel.name}**")
+                            await safe_followup(interaction, f"Je me déplace vers le salon vocal : **{channel.name}**")
                     else:
                         # Connexion si le client est présent mais déconnecté
                         await voice_client.connect()
-                        await interaction.followup.send(f"Je rejoins le salon vocal : **{channel.name}**")
+                        await safe_followup(interaction, f"Je rejoins le salon vocal : **{channel.name}**")
                 except discord.errors.ConnectionClosed as e:
                     # Réessayer la connexion si la session est invalide (erreur 4006)
                     await voice_client.disconnect(force=True)
                     await channel.connect()
-                    await interaction.followup.send(f"Session réinitialisée, je rejoins le salon : **{channel.name}**")
+                    await safe_followup(interaction, f"Session réinitialisée, je rejoins le salon : **{channel.name}**")
             else:
                 # Pas encore connecté, simple connexion
                 await channel.connect()
-                await interaction.followup.send(f"Je rejoins le salon vocal : **{channel.name}**")
+                await safe_followup(interaction, f"Je rejoins le salon vocal : **{channel.name}**")
 
         except Exception as e:
-            await interaction.followup.send(f"Je n'ai pas pu rejoindre le salon vocal : {e}", ephemeral=True)
+            await safe_followup(interaction, f"Je n'ai pas pu rejoindre le salon vocal : {e}", ephemeral=True)
     else:
         await interaction.response.send_message(
             "Tu dois être dans un salon vocal pour que je puisse te rejoindre.", ephemeral=True
@@ -1590,60 +1891,60 @@ async def quitter(interaction: discord.Interaction):
     if voice_client and voice_client.is_connected():
         await voice_client.disconnect()
         await interaction.response.send_message("Je quitte le salon vocal.")
-        print(f"[INFO] Déconnexion vocale du bot dans la guilde: {interaction.guild.name}")
     else:
         await interaction.response.send_message("Je ne suis pas dans un salon vocal.")
 
-@bot.tree.command(name="jouer", description="Jouer de la musique depuis une URL")
-@app_commands.describe(url="URL de la musique à jouer")
-async def jouer(interaction: discord.Interaction, url: str):
+@bot.tree.command(name="jouer", description="Jouer une musique en tapant son nom ou une URL")
+@app_commands.describe(recherche="Nom de la musique ou URL YouTube")
+async def jouer(interaction: discord.Interaction, recherche: str):
+    await safe_defer(interaction)
+
     if not interaction.user.voice or not interaction.user.voice.channel:
-        await interaction.response.send_message("Tu dois être dans un canal vocal pour utiliser cette commande.")
+        await safe_followup(interaction, "❌ Tu dois être dans un salon vocal.", ephemeral=True)
         return
 
-    await interaction.response.defer()
+    guild_id = interaction.guild.id
+    guild_text_channels[guild_id] = interaction.channel.id  # stocke le salon d'origine
 
-    channel = interaction.user.voice.channel
-    voice_client = discord.utils.get(bot.voice_clients, guild=interaction.guild)
+    # Recherche YouTube automatique si ce n'est pas une URL
+    if not (recherche.startswith("http://") or recherche.startswith("https://")):
+        recherche = f"ytsearch:{recherche}"
 
-    if voice_client is None:
-        voice_client = await channel.connect()
-    else:
-        await voice_client.move_to(channel)
-
-    if voice_client.is_playing():
-        voice_client.stop()
-
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'quiet': True,
-        'noplaylist': True,
-    }
-
+    ydl_opts = {'format': 'bestaudio/best', 'quiet': True, 'noplaylist': True}
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+            info = ydl.extract_info(recherche, download=False)
             if 'entries' in info:
                 info = info['entries'][0]
-            audio_url = info['url']
+            url = info['webpage_url']
             title = info.get('title', 'Musique inconnue')
     except Exception as e:
-        await interaction.followup.send(f"Impossible de lire la musique : {e}", ephemeral=True)
+        await safe_followup(interaction, f"❌ Musique introuvable : {e}", ephemeral=True)
         return
 
-    FFMPEG_OPTIONS = {
-        'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-        'options': '-vn'
-    }
+    if guild_id not in queues:
+        queues[guild_id] = []
 
-    source = discord.FFmpegPCMAudio(audio_url, **FFMPEG_OPTIONS)
-    source = discord.PCMVolumeTransformer(source, volume=0.5) # Volume de base à 50%
-    voice_client.play(source)
-    
-    # Stocke le voice_client pour cette guild
-    guild_players[interaction.guild.id] = voice_client
+    queues[guild_id].append((title, url))
 
-    await interaction.followup.send(f"🎵 Je joue : **{title}**")
+    # Connexion vocale propre
+    voice_channel = interaction.user.voice.channel
+    vc = discord.utils.get(bot.voice_clients, guild=interaction.guild)
+
+    if vc is None:
+        vc = await voice_channel.connect()
+        guild_players[guild_id] = vc
+    else:
+        if vc.channel != voice_channel:
+            await vc.move_to(voice_channel)
+        guild_players[guild_id] = vc
+
+    # Lancer la lecture seulement si rien ne joue
+    if not vc.is_playing() and not vc.is_paused():
+        t, u = queues[guild_id].pop(0)
+        await start_playing(guild_id, t, u)
+    else:
+        await safe_followup(interaction, f"✅ **{title}** a été ajoutée à la file d'attente !")
 
 @bot.tree.command(name="arreter", description="Arrêter la musique")
 async def arreter(interaction: discord.Interaction):
@@ -1688,7 +1989,7 @@ async def skyrock(interaction: discord.Interaction):
         await interaction.response.send_message("❌ Tu dois être dans un salon vocal pour écouter Skyrock.", ephemeral=True)
         return
     
-    await interaction.response.defer()
+    await safe_defer(interaction)
     
     channel = interaction.user.voice.channel
     voice_client = discord.utils.get(bot.voice_clients, guild=interaction.guild)
@@ -1704,9 +2005,10 @@ async def skyrock(interaction: discord.Interaction):
 
     FFMPEG_OPTIONS = {
         'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-        'options': '-vn'
+        # forcer 48kHz stéréo PCM signé 16-bit, éviter -nostdin pour que ffmpeg n'attende pas stdin
+        'options': '-vn -ar 48000 -ac 2 -f s16le -nostdin'
     }
-    
+     
     SKYROCK_STREAM_URL = "https://icecast.skyrock.net/s/natio_mp3_128k"
     
     source = discord.FFmpegPCMAudio(SKYROCK_STREAM_URL, **FFMPEG_OPTIONS)
@@ -1715,8 +2017,8 @@ async def skyrock(interaction: discord.Interaction):
     
     guild_players[interaction.guild.id] = voice_client
     
-    await interaction.followup.send("📻 **Skyrock en direct** est lancé !")
+    await safe_followup(interaction, "📻 **Skyrock en direct** est lancé !")
 
-# ------------ LANCEMENT DU BOT ------------ #
+# ------------ LANCEMENT DU BOT ------------ # 
 
 bot.run(TOKEN)
