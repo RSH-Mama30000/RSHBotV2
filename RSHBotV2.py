@@ -1,7 +1,6 @@
 # ------------ DÉPENDANCES (import, from) ------------ #
 
 import discord
-import yt_dlp
 import datetime
 import random
 import os
@@ -320,116 +319,9 @@ async def process_schedules():
 
         await asyncio.sleep(30)
 
-async def start_playing(guild_id: int, title: str, url: str):
-    vc = guild_players[guild_id]
-    current_track[guild_id] = (title, url)
-    volumes[guild_id] = volumes.get(guild_id, 0.5)
-
-    # Exécute yt_dlp dans un thread pour ne pas bloquer la boucle async (évite les coupures/crépits)
-    ydl_opts = {'format': 'bestaudio'}
-    ffmpeg_opts = {
-        # -ar 48000 et -ac 2 : Discord requiert du 48kHz stéréo pour une lecture sans artefacts
-        # -f s16le : format PCM signé 16-bit
-        'options': '-vn -ar 48000 -ac 2 -f s16le -nostdin',
-        'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
-    }
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = await asyncio.to_thread(ydl.extract_info, url, False)
-        audio_url = info.get('url')
-
-    # Crée la source en PCM à la fréquence appropriée, puis applique le volume
-    source = discord.FFmpegPCMAudio(audio_url, **ffmpeg_opts)
-    source = discord.PCMVolumeTransformer(source, volume=volumes[guild_id])
-    vc.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(guild_id), bot.loop))
-
-    await send_music_embed(guild_id, title)
-
-async def play_next(guild_id: int):
-    if queues[guild_id]:
-        t, u = queues[guild_id].pop(0)
-        await start_playing(guild_id, t, u)
-
-# ------------ BOUTON ------------ #
-
-class MusicControls(discord.ui.View):
-    def __init__(self, vc: discord.VoiceClient, guild_id: int):
-        super().__init__(timeout=None)
-        self.vc = vc
-        self.guild_id = guild_id
-
-    @discord.ui.button(label="⏯ Pause / Reprendre", style=discord.ButtonStyle.blurple)
-    async def pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
-        vc = guild_players.get(self.guild_id)
-        if vc.is_playing():
-            vc.pause()
-            await interaction.response.send_message("⏸ Musique mise en pause", ephemeral=True)
-        elif vc.is_paused():
-            vc.resume()
-            await interaction.response.send_message("▶️ Musique relancée", ephemeral=True)
-
-    @discord.ui.button(label="⏭ Passer", style=discord.ButtonStyle.green)
-    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
-        vc = guild_players.get(self.guild_id)
-        if vc.is_playing() or vc.is_paused():
-            vc.stop()
-        await interaction.response.send_message("⏭ Musique passée", ephemeral=True)
-
-    @discord.ui.button(label="🔉 -", style=discord.ButtonStyle.gray)
-    async def volume_down(self, interaction: discord.Interaction, button: discord.ui.Button):
-        vc = guild_players.get(self.guild_id)
-        if hasattr(vc.source, "volume"):
-            volumes[self.guild_id] = max(0.0, volumes.get(self.guild_id, 0.5) - 0.1)
-            vc.source.volume = volumes[self.guild_id]
-            await interaction.response.send_message(f"🔉 Volume: {int(volumes[self.guild_id]*100)}%", ephemeral=True)
-
-    @discord.ui.button(label="🔊 +", style=discord.ButtonStyle.gray)
-    async def volume_up(self, interaction: discord.Interaction, button: discord.ui.Button):
-        vc = guild_players.get(self.guild_id)
-        if hasattr(vc.source, "volume"):
-            volumes[self.guild_id] = min(2.0, volumes.get(self.guild_id, 0.5) + 0.1)
-            vc.source.volume = volumes[self.guild_id]
-            await interaction.response.send_message(f"🔊 Volume: {int(volumes[self.guild_id]*100)}%", ephemeral=True)
-
-    @discord.ui.button(label="🔁 Rejouer", style=discord.ButtonStyle.red)
-    async def restart(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.guild_id in current_track:
-            title, url = current_track[self.guild_id]
-            queues[self.guild_id].insert(0, (title, url))
-            vc = guild_players.get(self.guild_id)
-            vc.stop()
-            await interaction.response.send_message("🔁 Rejoué depuis le début", ephemeral=True)
-            
-async def send_music_embed(guild_id: int, title: str):
-    guild = bot.get_guild(guild_id)
-    vc = guild_players.get(guild_id)
-    if not vc or guild_id not in guild_text_channels:
-        return
-
-    channel = guild.get_channel(guild_text_channels[guild_id])
-    if not channel:
-        return
-
-    embed = discord.Embed(
-        title="🎶 Lecture en cours",
-        description=f"**{title}**",
-        color=0x00ffcc
-    )
-    embed.set_footer(text="RSH Music System")
-    view = MusicControls(vc, guild_id)
-    await channel.send(embed=embed, view=view)
-
 # ------------ DONNÉES POUR /commande ------------ #
   
 categories = {
-    "musique": {
-        "▶️ Jouer": {"description": "Joue de la musique dans un salon vocal.", "syntax": "/jouer [URL]"},
-        "⏹️ Arrêter": {"description": "Arrête la musique en cours.", "syntax": "/arrêter"},
-        "📥 Rejoindre": {"description": "Fait rejoindre le bot dans un salon vocal.", "syntax": "/rejoindre"},
-        "📤 Quitter": {"description": "Quitte le salon vocal.", "syntax": "/quitter"},
-        "🔊 Volume": {"description": "Change le volume de la musique.", "syntax": "/volume"},
-        "📻 Skyrock": {"description": "Lance Skyrock en direct.", "syntax": "/skyrock"},
-    },
     "jeux_fun": {       
         "🎁 Boîte Mystère": {"description": "Ouvre une boîte mystère pour découvrir une récompense aléatoire.", "syntax": "/boitemystere"},
         "🪙 Pile ou Face": {"description": "Lance une pièce pour jouer à Pile ou Face.", "syntax": "/pileouface"},
@@ -469,7 +361,6 @@ categories = {
 }
 
 display_names = {
-    "musique": "🎵 Musique",
     "jeux_fun": "🎮 Jeux & Fun",
     "utilitaires": "🛠️ Utilitaires",
     "discussion": "💬 Discussion",
@@ -649,7 +540,6 @@ async def on_member_remove(member: discord.Member):
 @bot.tree.command(name="commande", description="Affiche les commandes d'une catégorie")
 @app_commands.choices(
     catégorie=[
-        app_commands.Choice(name="🎵 Musique", value="musique"),
         app_commands.Choice(name="🎮 Jeux & Fun", value="jeux_fun"),
         app_commands.Choice(name="🛠️ Utilitaires", value="utilitaires"),
         app_commands.Choice(name="💬 Discussion", value="discussion"),
@@ -1840,184 +1730,6 @@ async def banlist(interaction: discord.Interaction, membre: discord.Member = Non
         embed.add_field(name="Bans programmés", value="Aucun ban programmé", inline=False)
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
-    
-# ------------ MUSIQUE ------------ #
-    
-@bot.tree.command(name="rejoindre", description="Le bot rejoint le vocal dans lequel tu te trouves.")
-async def rejoindre(interaction: discord.Interaction):
-    if interaction.user.voice and interaction.user.voice.channel:
-        channel = interaction.user.voice.channel
-        voice_client = interaction.guild.voice_client
-
-        try:
-            await safe_defer(interaction)  # Délai de réponse
-
-            # Si le bot est déjà connecté
-            if voice_client:
-                try:
-                    if voice_client.is_connected():
-                        if voice_client.channel.id == channel.id:
-                            await safe_followup(interaction, f"Je suis déjà dans le salon vocal : **{channel.name}**")
-                        else:
-                            await voice_client.move_to(channel)
-                            await safe_followup(interaction, f"Je me déplace vers le salon vocal : **{channel.name}**")
-                    else:
-                        # Connexion si le client est présent mais déconnecté
-                        await voice_client.connect()
-                        await safe_followup(interaction, f"Je rejoins le salon vocal : **{channel.name}**")
-                except discord.errors.ConnectionClosed as e:
-                    # Réessayer la connexion si la session est invalide (erreur 4006)
-                    await voice_client.disconnect(force=True)
-                    await channel.connect()
-                    await safe_followup(interaction, f"Session réinitialisée, je rejoins le salon : **{channel.name}**")
-            else:
-                # Pas encore connecté, simple connexion
-                await channel.connect()
-                await safe_followup(interaction, f"Je rejoins le salon vocal : **{channel.name}**")
-
-        except Exception as e:
-            await safe_followup(interaction, f"Je n'ai pas pu rejoindre le salon vocal : {e}", ephemeral=True)
-    else:
-        await interaction.response.send_message(
-            "Tu dois être dans un salon vocal pour que je puisse te rejoindre.", ephemeral=True
-        )
-        
-@bot.tree.command(name="quitter", description="Le bot quitte le vocal dans lequel il se trouve.")
-async def quitter(interaction: discord.Interaction):
-    if interaction.user.bot:
-        return 
-
-    voice_client = discord.utils.get(bot.voice_clients, guild=interaction.guild)
-    if voice_client and voice_client.is_connected():
-        await voice_client.disconnect()
-        await interaction.response.send_message("Je quitte le salon vocal.")
-    else:
-        await interaction.response.send_message("Je ne suis pas dans un salon vocal.")
-
-@bot.tree.command(name="jouer", description="Jouer une musique en tapant son nom ou une URL")
-@app_commands.describe(recherche="Nom de la musique ou URL YouTube")
-async def jouer(interaction: discord.Interaction, recherche: str):
-    await safe_defer(interaction)
-
-    if not interaction.user.voice or not interaction.user.voice.channel:
-        await safe_followup(interaction, "❌ Tu dois être dans un salon vocal.", ephemeral=True)
-        return
-
-    guild_id = interaction.guild.id
-    guild_text_channels[guild_id] = interaction.channel.id  # stocke le salon d'origine
-
-    # Recherche YouTube automatique si ce n'est pas une URL
-    if not (recherche.startswith("http://") or recherche.startswith("https://")):
-        recherche = f"ytsearch:{recherche}"
-
-    ydl_opts = {'format': 'bestaudio/best', 'quiet': True, 'noplaylist': True}
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(recherche, download=False)
-            if 'entries' in info:
-                info = info['entries'][0]
-            url = info['webpage_url']
-            title = info.get('title', 'Musique inconnue')
-    except Exception as e:
-        await safe_followup(interaction, f"❌ Musique introuvable : {e}", ephemeral=True)
-        return
-
-    if guild_id not in queues:
-        queues[guild_id] = []
-
-    queues[guild_id].append((title, url))
-
-    # Connexion vocale propre
-    voice_channel = interaction.user.voice.channel
-    vc = discord.utils.get(bot.voice_clients, guild=interaction.guild)
-
-    if vc is None:
-        vc = await voice_channel.connect()
-        guild_players[guild_id] = vc
-    else:
-        if vc.channel != voice_channel:
-            await vc.move_to(voice_channel)
-        guild_players[guild_id] = vc
-
-    # Lancer la lecture seulement si rien ne joue
-    if not vc.is_playing() and not vc.is_paused():
-        t, u = queues[guild_id].pop(0)
-        await start_playing(guild_id, t, u)
-    else:
-        await safe_followup(interaction, f"✅ **{title}** a été ajoutée à la file d'attente !")
-
-@bot.tree.command(name="arreter", description="Arrêter la musique")
-async def arreter(interaction: discord.Interaction):
-    voice_client = discord.utils.get(bot.voice_clients, guild=interaction.guild)
-
-    if not interaction.user.voice or not interaction.user.voice.channel:
-        await interaction.response.send_message("Tu dois être dans un salon vocal pour arrêter la musique.", ephemeral=True)
-        return
-
-    if voice_client and voice_client.is_connected():
-        if voice_client.is_playing():
-            voice_client.stop()
-            await interaction.response.send_message("🛑 Musique arrêtée.")
-        else:
-            await interaction.response.send_message("Aucune musique n'est en cours de lecture.", ephemeral=True)
-            
-    else:
-        await interaction.response.send_message("Je ne suis connecté à aucun salon vocal.", ephemeral=True)
-      
-@bot.tree.command(name="volume", description="Change le volume de la musique")
-@app_commands.describe(volume="0 à 200")
-async def volume(interaction: discord.Interaction, volume: int):
-    vc = guild_players.get(interaction.guild.id)
-    if not vc or not vc.is_playing():
-        await interaction.response.send_message("Rien n'est en cours !", ephemeral=True)
-        return
-    
-    # Limite le volume entre 0 et 200%
-    vol = max(0, min(volume, 200)) / 100
-    
-    # Change le voluume en live
-    if hasattr(vc.source, 'volume'):
-        vc.source.volume = vol
-    else:
-        vc.source = discord.PCMVolumeTransformer(vc.source, volume=vol)
-        
-    await interaction.response.send_message(f"Volume réglé à {int(vol*100)}%")
-     
-@bot.tree.command(name="skyrock", description="Écoute Skyrock en direct 🎶")
-async def skyrock(interaction: discord.Interaction):
-    if not interaction.user.voice or not interaction.user.voice.channel:
-        await interaction.response.send_message("❌ Tu dois être dans un salon vocal pour écouter Skyrock.", ephemeral=True)
-        return
-    
-    await safe_defer(interaction)
-    
-    channel = interaction.user.voice.channel
-    voice_client = discord.utils.get(bot.voice_clients, guild=interaction.guild)
-    
-    if voice_client is None:
-        voice_client = await channel.connect()
-    else:
-        await voice_client.move_to(channel)
-        
-    if voice_client.is_playing():
-        voice_client.stop()
-        
-
-    FFMPEG_OPTIONS = {
-        'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-        # forcer 48kHz stéréo PCM signé 16-bit, éviter -nostdin pour que ffmpeg n'attende pas stdin
-        'options': '-vn -ar 48000 -ac 2 -f s16le -nostdin'
-    }
-     
-    SKYROCK_STREAM_URL = "https://icecast.skyrock.net/s/natio_mp3_128k"
-    
-    source = discord.FFmpegPCMAudio(SKYROCK_STREAM_URL, **FFMPEG_OPTIONS)
-    source = discord.PCMVolumeTransformer(source, volume=0.5)
-    voice_client.play(source)
-    
-    guild_players[interaction.guild.id] = voice_client
-    
-    await safe_followup(interaction, "📻 **Skyrock en direct** est lancé !")
 
 # ------------ LANCEMENT DU BOT ------------ # 
 
